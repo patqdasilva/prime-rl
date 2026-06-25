@@ -6,7 +6,7 @@ from beartype import beartype as typechecker
 from jaxtyping import Bool, Float, Int, jaxtyped
 from torch import Tensor
 
-from prime_rl.configs.trainer import CustomLossConfig, DefaultLossConfig, IPOLossConfig, LossConfig
+from prime_rl.configs.trainer import CustomLossConfig, DefaultLossConfig, IPOLossConfig, LossConfig, TsallisLossConfig
 from prime_rl.utils.utils import import_object
 
 
@@ -102,6 +102,79 @@ def _safe_mean(values: Tensor, mask: Tensor) -> Tensor:
     """Mean of values over a boolean mask; returns 0 when mask is empty."""
     denom = torch.clamp_min(mask.sum(), 1)
     return values[mask].sum() / denom
+
+
+def project_simplex_l2(y: Tensor) -> Tensor:
+    """Project each row of ``y`` onto the probability simplex in L2 distance."""
+    if y.dim() != 2:
+        raise ValueError(f"project_simplex_l2 expects a rank-2 tensor, got shape {tuple(y.shape)}")
+
+    sorted_y, _ = torch.sort(y, dim=-1, descending=True)
+    cumulative = torch.cumsum(sorted_y, dim=-1) - 1
+    ranks = torch.arange(1, y.shape[-1] + 1, device=y.device, dtype=y.dtype).unsqueeze(0)
+    support = sorted_y - cumulative / ranks > 0
+    rho = support.sum(dim=-1).clamp_min(1)
+    theta = cumulative.gather(dim=-1, index=(rho - 1).unsqueeze(-1)).squeeze(-1) / rho.to(y.dtype)
+    return torch.clamp(y - theta.unsqueeze(-1), min=0)
+
+
+def tsallis_mirror_loss_fn(
+    current_logits: Float[Tensor, "batch seq vocab"],
+    old_logits: Float[Tensor, "batch seq vocab"],
+    action_ids: Int[Tensor, "batch seq"],
+    advantages: Float[Tensor, "batch seq"],
+    behavior_logprobs: Float[Tensor, "batch seq"],
+    loss_mask: Bool[Tensor, "batch seq"],
+    loss_config: TsallisLossConfig,
+) -> LossOutputs:
+    """q=2 Tsallis stochastic mirror-target update with target cross-entropy."""
+    valid = loss_mask.bool()
+    if not torch.any(valid):
+        return LossOutputs(loss=current_logits.sum() * 0.0, metrics={})
+
+    current_rows = current_logits[valid]
+    old_rows = old_logits[valid]
+    action_rows = action_ids[valid]
+    advantage_rows = advantages[valid]
+    behavior_logprob_rows = behavior_logprobs[valid]
+
+    token_losses: list[Tensor] = []
+    target_action_probs: list[Tensor] = []
+
+    for start in range(0, current_rows.shape[0], loss_config.chunk_size):
+        end = min(start + loss_config.chunk_size, current_rows.shape[0])
+        current_chunk = current_rows[start:end].float()
+        old_chunk = old_rows[start:end]
+        action_chunk = action_rows[start:end]
+        advantage_chunk = advantage_rows[start:end].float()
+        behavior_logprob_chunk = behavior_logprob_rows[start:end].float()
+
+        with torch.no_grad():
+            old_probs = torch.nn.functional.softmax(old_chunk.float(), dim=-1)
+            behavior_probs = torch.exp(behavior_logprob_chunk)
+            safe_behavior_probs = torch.clamp_min(behavior_probs, loss_config.prob_floor)
+            delta = loss_config.alpha * advantage_chunk / safe_behavior_probs
+            perturbed = old_probs.clone()
+            row_idx = torch.arange(end - start, device=current_rows.device)
+            perturbed[row_idx, action_chunk] += delta
+            target = project_simplex_l2(perturbed)
+            if not torch.all(target >= 0):
+                raise ValueError("Tsallis simplex projection produced a negative target probability.")
+            target_sums = target.sum(dim=-1)
+            if not torch.allclose(target_sums, torch.ones_like(target_sums), rtol=1e-5, atol=1e-5):
+                raise ValueError("Tsallis simplex projection produced target rows that do not sum to 1.")
+
+        current_log_probs = torch.nn.functional.log_softmax(current_chunk, dim=-1)
+        token_losses.append(-(target * current_log_probs).sum(dim=-1))
+        with torch.no_grad():
+            target_action_probs.append(target[row_idx, action_chunk])
+
+    loss = torch.cat(token_losses).sum()
+    target_action_prob = torch.cat(target_action_probs)
+    metrics = {
+        "tsallis_target_action_prob": target_action_prob.mean(),
+    }
+    return LossOutputs(loss=loss, metrics=metrics)
 
 
 def compute_importance_ratio_and_mismatch_kl(
@@ -269,8 +342,9 @@ def setup_loss_fns(loss_config: LossConfig) -> dict[str, LossFn]:
     - ``"opd"`` → ``opd_loss_fn`` (teacher KL as gradient signal, hardcoded
       DPPO + KL knobs)
     - ``"rl"``  → ``default_loss_fn(loss_config)`` for ``DefaultLossConfig``,
-      ``ipo_loss_fn(loss_config)`` for ``IPOLossConfig``, or the imported
-      function for ``CustomLossConfig``.
+      ``ipo_loss_fn(loss_config)`` for ``IPOLossConfig``,
+      the trainer's full-logits path for ``TsallisLossConfig``, or the
+      imported function for ``CustomLossConfig``.
 
     ``trainer.loss`` only affects the rl path - opd and sft are independent.
     """
@@ -284,6 +358,10 @@ def setup_loss_fns(loss_config: LossConfig) -> dict[str, LossFn]:
 
         def rl_fn(inputs: LossInputs) -> LossOutputs:
             return ipo_loss_fn(inputs, loss_config)
+    elif isinstance(loss_config, TsallisLossConfig):
+
+        def rl_fn(inputs: LossInputs) -> LossOutputs:
+            raise ValueError("Tsallis loss requires full logits and is handled directly by the RL trainer.")
     else:
 
         def rl_fn(inputs: LossInputs) -> LossOutputs:

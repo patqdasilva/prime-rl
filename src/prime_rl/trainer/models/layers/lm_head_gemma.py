@@ -24,6 +24,11 @@ class GemmaFusedOutputLinear(torch.nn.Linear):
         labels: torch.Tensor | None = None,
         temperature: Tensor | None = None,
     ) -> PrimeLmOutput:
+        if labels is None:
+            logits = super().forward(hidden_states)
+            logits = self.softcap * torch.tanh(logits / self.softcap)
+            return PrimeLmOutput(logits=logits)
+
         assert labels is not None, "GemmaFusedOutputLinear requires labels for chunked logprob computation"
         assert temperature is not None, "GemmaFusedOutputLinear requires per-token temperatures"
 

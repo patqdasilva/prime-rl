@@ -17,7 +17,7 @@ from prime_rl.trainer.ckpt import setup_ckpt_managers
 from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
-from prime_rl.configs.trainer import TrainerConfig
+from prime_rl.configs.trainer import TrainerConfig, TsallisLossConfig
 from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
 from prime_rl.utils.cp import (
     gather_for_cp,
@@ -32,6 +32,8 @@ from prime_rl.trainer.rl.loss import (
     compute_importance_ratio_and_mismatch_kl,
     selective_log_softmax,
     setup_loss_fns,
+    shift_logits,
+    tsallis_mirror_loss_fn,
     shift_tensor_left,
     shift_tensor_right,
 )
@@ -403,6 +405,7 @@ def train(config: TrainerConfig):
             )
 
             labels = shift_tensor_left(input_ids)
+            full_input_ids = input_ids
 
             # VLM + CP is not supported: MRoPE requires global positions but CP shards the sequence
             if cp_enabled and mm_kwargs is not None:
@@ -431,10 +434,14 @@ def train(config: TrainerConfig):
                 set_lora_num_tokens(lora_num_tokens)
 
             temperatures = micro_batch["temperatures"].to("cuda")
+            full_temperatures = temperatures
 
             # Shard temperatures for context parallelism if enabled
             if cp_enabled:
                 temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
+
+            use_tsallis_loss = isinstance(config.loss, TsallisLossConfig) and micro_batch["training_mode"] == "rl"
+            sequence_lengths = micro_batch["sequence_lengths"]
 
             # Forward pass with per-token temperatures
             with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
@@ -442,50 +449,70 @@ def train(config: TrainerConfig):
                     model,
                     input_ids,
                     forward_position_ids,
-                    labels=labels,
+                    labels=None if use_tsallis_loss else labels,
                     temperature=temperatures,
                     mm_kwargs=mm_kwargs,
                     mm_token_type_ids=mm_token_type_ids,
                     routed_experts=routed_experts,
                 )
 
-            if out.get("logprobs") is None:
-                # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
-                assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
-                logits = out["logits"]
-                # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
-                scaled_logits = logits / temperatures.unsqueeze(-1)
-                out["logprobs"] = selective_log_softmax(scaled_logits, labels)
-                out["entropy"] = compute_entropy(scaled_logits)
-            # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures
+            if use_tsallis_loss:
+                assert out.get("logits") is not None, "Tsallis loss requires full logits from the actor forward pass"
+                if cp_enabled:
+                    out["logits"] = gather_for_cp(out["logits"], cp_group)
 
-            if cp_enabled:
-                out["logprobs"] = gather_for_cp(out["logprobs"], cp_group)
-                out["entropy"] = gather_for_cp_wo_grad(out["entropy"], cp_size, cp_group)
+                shifted_logits = shift_logits(out["logits"])
+                scaled_logits = shifted_logits / full_temperatures.unsqueeze(-1)
+                out["logprobs"] = selective_log_softmax(scaled_logits, full_input_ids)
+                out["entropy"] = torch.zeros_like(out["logprobs"])
 
-            vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
-            # This is not really necessary as the first token should be masked out, but we do it anyway to be sure
-            out["logprobs"] = shift_tensor_right(
-                out["logprobs"], pad_value=torch.log(torch.tensor(1.0 / vocab_size)).item()
-            )
-            out["entropy"] = shift_tensor_right(
-                out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
-            )
+                loss_result = tsallis_mirror_loss_fn(
+                    current_logits=scaled_logits,
+                    old_logits=scaled_logits.detach(),
+                    action_ids=full_input_ids,
+                    advantages=advantages,
+                    behavior_logprobs=inference_logprobs,
+                    loss_mask=loss_mask,
+                    loss_config=config.loss,
+                )
+                loss = loss_result.loss / loss_scale
+                loss_tensors = loss_result.metrics
+            else:
+                if out.get("logprobs") is None:
+                    # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
+                    assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
+                    logits = out["logits"]
+                    # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
+                    scaled_logits = logits / temperatures.unsqueeze(-1)
+                    out["logprobs"] = selective_log_softmax(scaled_logits, labels)
+                    out["entropy"] = compute_entropy(scaled_logits)
+                # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures
 
-            # Compute loss
-            sequence_lengths = micro_batch["sequence_lengths"]
-            loss, loss_tensors = compute_loss(
-                trainer_logprobs=out["logprobs"].squeeze().split(sequence_lengths),
-                inference_logprobs=inference_logprobs.squeeze().split(sequence_lengths),
-                teacher_logprobs=teacher_logprobs.squeeze().split(sequence_lengths)
-                if teacher_logprobs is not None
-                else None,
-                advantages=advantages.squeeze().split(sequence_lengths),
-                loss_mask=loss_mask.squeeze().split(sequence_lengths),
-                loss_fns=loss_fns,
-                loss_scale=loss_scale,
-                training_mode=micro_batch["training_mode"],
-            )
+                if cp_enabled:
+                    out["logprobs"] = gather_for_cp(out["logprobs"], cp_group)
+                    out["entropy"] = gather_for_cp_wo_grad(out["entropy"], cp_size, cp_group)
+
+                vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
+                # This is not really necessary as the first token should be masked out, but we do it anyway to be sure
+                out["logprobs"] = shift_tensor_right(
+                    out["logprobs"], pad_value=torch.log(torch.tensor(1.0 / vocab_size)).item()
+                )
+                out["entropy"] = shift_tensor_right(
+                    out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
+                )
+
+                loss, loss_tensors = compute_loss(
+                    trainer_logprobs=out["logprobs"].squeeze().split(sequence_lengths),
+                    inference_logprobs=inference_logprobs.squeeze().split(sequence_lengths),
+                    teacher_logprobs=teacher_logprobs.squeeze().split(sequence_lengths)
+                    if teacher_logprobs is not None
+                    else None,
+                    advantages=advantages.squeeze().split(sequence_lengths),
+                    loss_mask=loss_mask.squeeze().split(sequence_lengths),
+                    loss_fns=loss_fns,
+                    loss_scale=loss_scale,
+                    training_mode=micro_batch["training_mode"],
+                )
 
             # Backward pass
             with maybe_record_function("backward"):

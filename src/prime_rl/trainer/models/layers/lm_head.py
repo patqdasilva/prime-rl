@@ -47,6 +47,9 @@ class FusedOutputLinear(torch.nn.Linear):
         labels: torch.Tensor | None = None,
         temperature: Tensor | None = None,
     ) -> PrimeLmOutput:
+        if labels is None:
+            return PrimeLmOutput(logits=super().forward(hidden_states))
+
         assert labels is not None, "FusedOutputLinear requires labels for chunked logprob computation"
         assert temperature is not None, "FusedOutputLinear requires per-token temperatures"
 

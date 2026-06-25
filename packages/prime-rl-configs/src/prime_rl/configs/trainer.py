@@ -437,6 +437,19 @@ class IPOLossConfig(BaseConfig):
     """Temperature for the KL term."""
 
 
+class TsallisLossConfig(BaseConfig):
+    type: Literal["tsallis"] = "tsallis"
+
+    alpha: float = Field(1.0, ge=0)
+    """Step size for the q=2 Tsallis mirror-target coordinate perturbation."""
+
+    prob_floor: float = Field(1e-6, gt=0)
+    """Minimum rollout behavior probability used in the inverse-probability correction."""
+
+    chunk_size: int = Field(128, ge=1)
+    """Number of valid token rows to process at once when materializing full-vocabulary targets."""
+
+
 class CustomLossConfig(BaseConfig):
     type: Literal["custom"] = "custom"
 
@@ -447,7 +460,9 @@ class CustomLossConfig(BaseConfig):
     """Kwargs forwarded to the loss function."""
 
 
-LossConfig: TypeAlias = Annotated[DefaultLossConfig | IPOLossConfig | CustomLossConfig, Field(discriminator="type")]
+LossConfig: TypeAlias = Annotated[
+    DefaultLossConfig | IPOLossConfig | TsallisLossConfig | CustomLossConfig, Field(discriminator="type")
+]
 
 
 class FakeDataLoaderConfig(BaseConfig):

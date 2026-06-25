@@ -7,6 +7,7 @@ This page covers the math and the configurable algorithmic components: how off-p
 - [Async / Off-Policy Training](#async--off-policy-training)
 - [Loss](#loss)
   - [Default Loss](#default-loss)
+  - [Tsallis Mirror-Target Loss](#tsallis-mirror-target-loss)
   - [Custom Loss](#custom-loss)
 - [Advantage](#advantage)
   - [Default Advantage](#default-advantage)
@@ -76,6 +77,28 @@ The trainer dispatches automatically based on the batch's training mode (set by 
 - `sft` mode → standard token-level NLL on teacher-generated rollouts.
 
 Set `[trainer.loss] type = "default"` and configure via the knobs above. SFT and OPD modes ignore the policy-gradient–specific fields.
+
+### Tsallis Mirror-Target Loss
+
+The Tsallis loss implements the stochastic q=2 mirror-target update for RL batches. For each trainable response token $a_t$, the trainer constructs a detached full-vocabulary target
+
+$$
+p_t^\star = \Pi_\Delta\left(p_t^- + \alpha\frac{\hat A_t}{b_t(a_t)}e_{a_t}\right)
+$$
+
+where $b_t(a_t)$ is the rollout-time sampled-token probability from `completion_logprobs`, and $p_t^-$ is the fixed pre-step actor distribution from the trainer forward pass. The actor is then fit to $p_t^\star$ with target cross-entropy. Prime-RL processes valid token rows in chunks because the exact simplex projection transiently materializes full-vocabulary probabilities.
+
+Configure it with:
+
+```toml
+[trainer.loss]
+type = "tsallis"
+alpha = 1.0
+prob_floor = 1e-6
+chunk_size = 128
+```
+
+SFT and OPD modes continue to use their mode-specific losses; `type = "tsallis"` only changes RL batches.
 
 ### Custom Loss
 
